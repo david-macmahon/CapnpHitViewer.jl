@@ -22,7 +22,8 @@
 # Note: `__init__` does NOT run during precompilation, so `SETICORE_SCHEMA[]`
 # is empty here.  The workload parses `SETICORE_SCHEMA_TEXT` directly (which
 # is exactly what `__init__` will do at runtime) and populates the Ref for
-# the duration of the workload so the reader functions work.
+# the duration of the workload so the reader functions work, then clears
+# it so the runtime `__init__` starts from a clean state.
 
 "Build a single minimal Hit message as a packed Cap'n Proto byte vector."
 function _make_synthetic_hit(sf::SchemaFile, frequency::Float64)::Vector{UInt8}
@@ -116,23 +117,215 @@ end
                                 Tachikoma.PixelSnapshot[])
             m = HitViewerModel(path=tmp_hits, hits=hits, table=table)
             _load_heatmap!(m)
-            # view mode render
-            view(m, f)
-            # browse mode render (picker path)
+            # view mode render — call via Base.invokelatest with model typed
+            # as the abstract Model, exactly as Tachikoma's app loop does
+            # (app.jl:1178-1185). Direct concrete calls (view(m, f)) don't
+            # precompile the specializations reached through the
+            # invokelatest + abstract-type barrier; the invokelatest call
+            # here ensures view(::HitViewerModel, ::Frame) and every
+            # concrete callee it dispatches to (render(::DataTable),
+            # render(::PixelImage, ::Rect, ::Frame), render(::StatusBar),
+            # _render_view, _render_heatmap, _render_footer, etc.) are
+            # compiled with the same dispatch path the runtime uses.
+            model::Model = m
+            Base.invokelatest(view, model, f)
+            # browse mode render (picker path) — also via invokelatest
             _open_picker!(m; start_dir=dirname(tmp_hits))
-            view(m, f)
-            # update! paths: navigate in view mode
+            Base.invokelatest(view, m, f)
+
+            # ── Sixel/kitty graphics-protocol render paths ───────────
+            # The render(::PixelImage, ::Rect, ::Frame) method dispatches
+            # on GRAPHICS_PROTOCOL[]: gfx_none → braille fallback (already
+            # exercised above), gfx_sixel → encode_sixel + render_graphics!,
+            # gfx_kitty → encode_kitty + render_graphics!. The sixel and
+            # kitty branches have their own compile costs (~8 ms and ~18 ms
+            # for encode_kitty, ~12 ms for render_graphics! with kitty
+            # format) that are NOT precompiled by the braille path. Exercise
+            # each by temporarily switching the global protocol and
+            # re-rendering the heatmap, then restore.
+            #
+            # Use direct concrete calls here (not invokelatest): the gfx
+            # dispatch is on GRAPHICS_PROTOCOL[] (a global Ref), not on
+            # the model type, so there's no abstract-type barrier. The
+            # concrete render(img, area, f; tick=) call fully specializes
+            # the encode_kitty/encode_sixel/render_graphics! kwcalls.
             m.mode = :view
             m.picker = nothing
-            update!(m, Tachikoma.KeyEvent(:down, Char(0)))
-            update!(m, Tachikoma.KeyEvent(:char, 'r'))
-            # update! path: picker key handling
+            saved_gfx = Tachikoma.GRAPHICS_PROTOCOL[]
+            # Render the heatmap directly: build a PixelImage, populate it,
+            # and call render with each protocol. This bypasses the view
+            # dispatch and exercises the exact gfx-branch code paths.
+            heat_data = m.heatmap
+            if heat_data !== nothing
+                heat_pixels = _heatmap_to_pixels(heat_data, m.heatmap_min, m.heatmap_max, 80, 30)
+                for gfx in (Tachikoma.gfx_sixel, Tachikoma.gfx_kitty)
+                    Tachikoma.GRAPHICS_PROTOCOL[] = gfx
+                    img = Tachikoma.PixelImage(60, 30)
+                    copyto!(img.pixels, heat_pixels)
+                    Tachikoma.render(img, Tachikoma.Rect(1, 1, 60, 30), f; tick=1)
+                end
+                # Also call the encoders + render_graphics! directly with
+                # explicit keywords. The render() call above invokes them
+                # via keyword dispatch (Core.kwcall), but @compile_workload
+                # may not persist kwcall specializations that are only
+                # reached through another function's kwcall. Direct calls
+                # here ensure the encoder kwcalls themselves are compiled.
+                kdata = Tachikoma.encode_kitty(heat_pixels;
+                                               decay=Tachikoma.DecayParams(),
+                                               tick=1, cols=60, rows=30)
+                sdata = Tachikoma.encode_sixel(heat_pixels;
+                                               decay=Tachikoma.DecayParams(),
+                                               tick=1)
+                Tachikoma.render_graphics!(f, kdata, Tachikoma.Rect(1, 1, 60, 30);
+                                           pixels=heat_pixels,
+                                           format=Tachikoma.gfx_fmt_kitty)
+                Tachikoma.render_graphics!(f, sdata, Tachikoma.Rect(1, 1, 60, 30);
+                                           pixels=heat_pixels,
+                                           format=Tachikoma.gfx_fmt_sixel)
+            end
+            Tachikoma.GRAPHICS_PROTOCOL[] = saved_gfx
+
+            # ── Navigation keys via the same invokelatest barrier ─────
+            # The app loop dispatches events via
+            # `Base.invokelatest(dispatch_event!, ..., model::Model, evt::Event)`
+            # (app.jl:1133). Direct concrete update!(m, evt) calls don't
+            # precompile the specializations reached through that barrier.
+            # Exercise every key symbol our app forwards to the widgets,
+            # plus mouse press/scroll, in both modes — all via invokelatest.
+
+            # View mode: DataTable navigation + mouse
+            m.mode = :view
+            m.picker = nothing
+            for k in (:down, :up, :pageup, :pagedown, :home, :end_key,
+                      :left, :right)
+                Base.invokelatest(update!, model, Tachikoma.KeyEvent(k, Char(0)))
+            end
+            Base.invokelatest(update!, model, Tachikoma.KeyEvent(:char, 'r'))
+            Base.invokelatest(update!, model,
+                              Tachikoma.MouseEvent(5, 5, Tachikoma.mouse_left,
+                                                   Tachikoma.mouse_press,
+                                                   false, false, false))
+            Base.invokelatest(update!, model,
+                              Tachikoma.MouseEvent(5, 5, Tachikoma.mouse_scroll_down,
+                                                   Tachikoma.mouse_press,
+                                                   false, false, false))
+
+            # Browse mode: SelectableList navigation + mouse
             _open_picker!(m; start_dir=dirname(tmp_hits))
-            update!(m, Tachikoma.KeyEvent(:enter, Char(0)))
-            update!(m, Tachikoma.KeyEvent(:backspace, Char(0)))
-            update!(m, Tachikoma.KeyEvent(:char, 'h'))
-            update!(m, Tachikoma.KeyEvent(:escape, Char(0)))
+            for k in (:down, :up, :pageup, :pagedown, :home, :end_key)
+                Base.invokelatest(update!, model, Tachikoma.KeyEvent(k, Char(0)))
+            end
+            Base.invokelatest(update!, model,
+                              Tachikoma.MouseEvent(5, 5, Tachikoma.mouse_left,
+                                                   Tachikoma.mouse_press,
+                                                   false, false, false))
+            Base.invokelatest(update!, model,
+                              Tachikoma.MouseEvent(5, 5, Tachikoma.mouse_scroll_down,
+                                                   Tachikoma.mouse_press,
+                                                   false, false, false))
+            # Picker-specific keys (return early from _picker_handle_key!,
+            # but exercise the dispatch anyway)
+            for k in (:enter, :backspace, :escape)
+                Base.invokelatest(update!, model, Tachikoma.KeyEvent(k, Char(0)))
+            end
+            for c in ('h', 'r', 'q')
+                Base.invokelatest(update!, model, Tachikoma.KeyEvent(:char, c))
+            end
         end
+
+        # ── Explicit precompile() for invokelatest-defeated specializations ──
+        # Tachikoma's app loop dispatches events via
+        # `Base.invokelatest(dispatch_event!, ..., model::Model, evt::Event)`
+        # where `model` is typed as the abstract `Model`. This defeats
+        # method specialization across the call boundary, so the
+        # concrete specializations `update!(::HitViewerModel, ::KeyEvent)`
+        # and `update!(::HitViewerModel, ::MouseEvent)` — and the widget
+        # handle_key!/handle_mouse! methods they call — are NOT picked up
+        # by `@compile_workload`'s implicit inference. The 10-18 ms cold
+        # latency on the first picker :down was exactly this:
+        # `handle_key!(::SelectableList, ::KeyEvent)` compiling on first
+        # runtime dispatch. Explicit `precompile()` calls force these
+        # specializations into the precompile cache.
+        precompile(CapnpHitViewer.update!,
+                   (HitViewerModel, Tachikoma.KeyEvent))
+        precompile(CapnpHitViewer.update!,
+                   (HitViewerModel, Tachikoma.MouseEvent))
+        precompile(Tachikoma.handle_key!,
+                   (Tachikoma.SelectableList, Tachikoma.KeyEvent))
+        precompile(Tachikoma.handle_mouse!,
+                   (Tachikoma.SelectableList, Tachikoma.MouseEvent))
+        precompile(Tachikoma.handle_key!,
+                   (Tachikoma.DataTable, Tachikoma.KeyEvent))
+        precompile(Tachikoma.handle_mouse!,
+                   (Tachikoma.DataTable, Tachikoma.MouseEvent))
+        # The picker and view dispatch helpers, also reached via update!
+        precompile(CapnpHitViewer._picker_handle_key!,
+                   (FilePicker, Tachikoma.KeyEvent))
+        precompile(CapnpHitViewer._picker_handle_mouse!,
+                   (FilePicker, Tachikoma.MouseEvent))
+        precompile(CapnpHitViewer._update_view!,
+                   (HitViewerModel, Tachikoma.KeyEvent))
+
+        # ── Render path specializations (same invokelatest barrier) ──
+        # Tachikoma's app loop calls `view(model, f)` via
+        # `Base.invokelatest() do; view(model, f); end` with
+        # `model::Model` (abstract). The concrete specialization
+        # `view(::HitViewerModel, ::Frame)` and the widget render methods
+        # it calls are NOT picked up by @compile_workload's implicit
+        # inference. Measured cold costs:
+        #   render(::StatusBar, ::Rect, ::Buffer)  ~100 ms cold
+        #   render(::DataTable, ::Rect, ::Buffer)  ~18 ms cold
+        #   render(::PixelImage, ::Rect, ::Frame)  ~12 ms cold
+        #   view(::HitViewerModel, ::Frame)        ~30 ms cold (sum of above)
+        # Force these specializations into the precompile cache.
+        precompile(CapnpHitViewer.view, (HitViewerModel, Tachikoma.Frame))
+        precompile(CapnpHitViewer._render_view, (HitViewerModel, Tachikoma.Frame))
+        precompile(CapnpHitViewer._render_heatmap,
+                   (HitViewerModel, Tachikoma.Rect, Tachikoma.Frame))
+        precompile(CapnpHitViewer._render_footer,
+                   (HitViewerModel, Tachikoma.Rect, Tachikoma.Buffer))
+        precompile(CapnpHitViewer._draw_pixel_heatmap,
+                   (HitViewerModel, Matrix{Float32}, Tachikoma.Rect, Tachikoma.Frame))
+        precompile(CapnpHitViewer._draw_heatmap_info,
+                   (HitViewerModel, Matrix{Float32}, Tachikoma.Rect, Tachikoma.Buffer))
+        precompile(CapnpHitViewer._render_picker, (FilePicker, Tachikoma.Frame))
+        # Tachikoma widget render methods reached through our view path.
+        # render(::PixelImage, ::Rect, ::Frame) has a `tick` keyword, so
+        # its dispatch goes through Core.kwcall — precompile both forms.
+        precompile(Tachikoma.render,
+                   (Tachikoma.StatusBar, Tachikoma.Rect, Tachikoma.Buffer))
+        precompile(Tachikoma.render,
+                   (Tachikoma.DataTable, Tachikoma.Rect, Tachikoma.Buffer))
+        precompile(Tachikoma.render,
+                   (Tachikoma.PixelImage, Tachikoma.Rect, Tachikoma.Frame))
+        precompile(Core.kwcall,
+                   (NamedTuple{(:tick,), Tuple{Int}}, typeof(Tachikoma.render),
+                    Tachikoma.PixelImage, Tachikoma.Rect, Tachikoma.Frame))
+        # Sixel/kitty encoder kwcalls — reached from render(::PixelImage)
+        # when GRAPHICS_PROTOCOL[] is gfx_sixel/gfx_kitty. The braille
+        # fallback path (gfx_none) doesn't compile these.
+        precompile(Core.kwcall,
+                   (NamedTuple{(:decay, :tick, :cols, :rows),
+                                Tuple{Tachikoma.DecayParams, Int, Int, Int}},
+                    typeof(Tachikoma.encode_kitty), Matrix{Tachikoma.ColorRGBA}))
+        precompile(Core.kwcall,
+                   (NamedTuple{(:decay, :tick),
+                                Tuple{Tachikoma.DecayParams, Int}},
+                    typeof(Tachikoma.encode_sixel), Matrix{Tachikoma.ColorRGBA}))
+        # render_graphics! kwcall (pixels + format keywords) — reached
+        # from both sixel and kitty branches.
+        precompile(Core.kwcall,
+                   (NamedTuple{(:pixels, :format),
+                                Tuple{Matrix{Tachikoma.ColorRGBA}, Tachikoma.GraphicsFormat}},
+                    typeof(Tachikoma.render_graphics!),
+                    Tachikoma.Frame, Vector{UInt8}, Tachikoma.Rect))
+        # The app loop's dispatch_event! (also called via invokelatest).
+        precompile(Tachikoma.dispatch_event!,
+                    (Tachikoma.Terminal, Tachikoma.AppOverlay,
+                     HitViewerModel, Tachikoma.KeyEvent, Bool))
+        precompile(Tachikoma.dispatch_event!,
+                    (Tachikoma.Terminal, Tachikoma.AppOverlay,
+                     HitViewerModel, Tachikoma.MouseEvent, Bool))
     finally
         isfile(tmp_hits) && rm(tmp_hits; force=true)
     end
