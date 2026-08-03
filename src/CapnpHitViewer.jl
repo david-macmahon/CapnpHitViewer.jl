@@ -2,7 +2,16 @@ module CapnpHitViewer
 
 using CapnProto
 using Tachikoma
+using CairoMakie
+using CairoMakie.Cairo: CairoImageSurface, CairoSurfaceImage
+using CairoMakie.Colors: RGB24
 using PrecompileTools: @compile_workload
+# Tachikoma and Makie both export MouseEvent (and possibly other names).
+# Explicitly import the Tachikoma bindings we use unqualified so the
+# `using Tachikoma` above doesn't create ambiguities now that Makie is
+# also loaded.
+import Tachikoma: MouseEvent, KeyEvent
+import Tachikoma: Fixed, Rect, bottom, right, set_theme!
 import Tachikoma: view, update!, should_quit, init!, cleanup!,
                  handle_all_key_actions, copy_rect, task_queue,
                  recording_enabled, has_pending_output, set_wake!

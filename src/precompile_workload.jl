@@ -7,8 +7,7 @@
 #   first iterate(MessageIterator) ~2000 ms   (parse_messages + read_struct)
 #   load_hit_data / parse_message   ~730 ms
 #   _build_table (DataTable ctor)   ~550 ms
-#   _heatmap_to_pixels              ~190 ms
-#   _draw_pixel_heatmap (PixelImage + render) ~2300 ms
+#   _draw_pixel_heatmap (Makie render) ~1700 ms (first plot compiles)
 #   FilePicker ctor                 ~720 ms
 #   view (full view-mode render)   ~3240 ms
 #   update! (handle_key! DataTable) ~140 ms
@@ -96,11 +95,6 @@ end
             # _build_table / DataTable ctor (~550 ms cold)
             table = _build_table(hits)
 
-            # _heatmap_to_pixels inner loop + _heatmap_color (~190 ms cold)
-            vmin = Float32(minimum(data))
-            vmax = Float32(maximum(data))
-            _heatmap_to_pixels(data, vmin, vmax, 80, 30)
-
             # ── FilePicker ctor (~720 ms cold) ──────────────────────
             # Use dirname(tmp_hits) so the picker sees a real directory.
             FilePicker(start_dir=dirname(tmp_hits))
@@ -134,35 +128,30 @@ end
             Base.invokelatest(view, m, f)
 
             # ── Sixel/kitty graphics-protocol render paths ───────────
-            # The render(::PixelImage, ::Rect, ::Frame) method dispatches
-            # on GRAPHICS_PROTOCOL[]: gfx_none → braille fallback (already
-            # exercised above), gfx_sixel → encode_sixel + render_graphics!,
-            # gfx_kitty → encode_kitty + render_graphics!. The sixel and
-            # kitty branches have their own compile costs (~8 ms and ~18 ms
-            # for encode_kitty, ~12 ms for render_graphics! with kitty
-            # format) that are NOT precompiled by the braille path. Exercise
-            # each by temporarily switching the global protocol and
-            # re-rendering the heatmap, then restore.
+            # _draw_pixel_heatmap now ends with render(m.img, area, f; tick=),
+            # which dispatches on GRAPHICS_PROTOCOL[]: gfx_none → braille,
+            # gfx_sixel → encode_sixel + render_graphics!, gfx_kitty →
+            # encode_kitty + render_graphics!. Exercise each protocol by
+            # switching the global and re-rendering. The first call (per
+            # protocol) pays the Makie render cost; subsequent calls with
+            # the same area size hit the cache and only re-encode.
             #
             # Use direct concrete calls here (not invokelatest): the gfx
             # dispatch is on GRAPHICS_PROTOCOL[] (a global Ref), not on
-            # the model type, so there's no abstract-type barrier. The
-            # concrete render(img, area, f; tick=) call fully specializes
-            # the encode_kitty/encode_sixel/render_graphics! kwcalls.
+            # the model type, so there's no abstract-type barrier.
             m.mode = :view
             m.picker = nothing
             saved_gfx = Tachikoma.GRAPHICS_PROTOCOL[]
-            # Render the heatmap directly: build a PixelImage, populate it,
-            # and call render with each protocol. This bypasses the view
-            # dispatch and exercises the exact gfx-branch code paths.
             heat_data = m.heatmap
             if heat_data !== nothing
-                heat_pixels = _heatmap_to_pixels(heat_data, m.heatmap_min, m.heatmap_max, 80, 30)
-                for gfx in (Tachikoma.gfx_sixel, Tachikoma.gfx_kitty)
+                heat_area = Tachikoma.Rect(1, 1, 60, 20)
+                for gfx in (Tachikoma.gfx_none, Tachikoma.gfx_sixel,
+                            Tachikoma.gfx_kitty)
                     Tachikoma.GRAPHICS_PROTOCOL[] = gfx
-                    img = Tachikoma.PixelImage(60, 30)
-                    copyto!(img.pixels, heat_pixels)
-                    Tachikoma.render(img, Tachikoma.Rect(1, 1, 60, 30), f; tick=1)
+                    # Force a cache miss each iteration by resetting surf
+                    # so the Makie render (not just the encoder) runs.
+                    m.surf = CairoImageSurface(RGB24[;;])
+                    _draw_pixel_heatmap(m, heat_data, heat_area, f)
                 end
                 # Also call the encoders + render_graphics! directly with
                 # explicit keywords. The render() call above invokes them
@@ -170,16 +159,17 @@ end
                 # may not persist kwcall specializations that are only
                 # reached through another function's kwcall. Direct calls
                 # here ensure the encoder kwcalls themselves are compiled.
+                heat_pixels = m.img.pixels
                 kdata = Tachikoma.encode_kitty(heat_pixels;
                                                decay=Tachikoma.DecayParams(),
-                                               tick=1, cols=60, rows=30)
+                                               tick=1, cols=60, rows=20)
                 sdata = Tachikoma.encode_sixel(heat_pixels;
                                                decay=Tachikoma.DecayParams(),
                                                tick=1)
-                Tachikoma.render_graphics!(f, kdata, Tachikoma.Rect(1, 1, 60, 30);
+                Tachikoma.render_graphics!(f, kdata, Tachikoma.Rect(1, 1, 60, 20);
                                            pixels=heat_pixels,
                                            format=Tachikoma.gfx_fmt_kitty)
-                Tachikoma.render_graphics!(f, sdata, Tachikoma.Rect(1, 1, 60, 30);
+                Tachikoma.render_graphics!(f, sdata, Tachikoma.Rect(1, 1, 60, 20);
                                            pixels=heat_pixels,
                                            format=Tachikoma.gfx_fmt_sixel)
             end
@@ -286,8 +276,6 @@ end
                    (HitViewerModel, Tachikoma.Rect, Tachikoma.Buffer))
         precompile(CapnpHitViewer._draw_pixel_heatmap,
                    (HitViewerModel, Matrix{Float32}, Tachikoma.Rect, Tachikoma.Frame))
-        precompile(CapnpHitViewer._draw_heatmap_info,
-                   (HitViewerModel, Matrix{Float32}, Tachikoma.Rect, Tachikoma.Buffer))
         precompile(CapnpHitViewer._render_picker, (FilePicker, Tachikoma.Frame))
         # Tachikoma widget render methods reached through our view path.
         # render(::PixelImage, ::Rect, ::Frame) has a `tick` keyword, so

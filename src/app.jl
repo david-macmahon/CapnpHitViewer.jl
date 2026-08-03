@@ -40,10 +40,14 @@
     # Cached heatmap data for the currently selected hit
     current_idx::Int = 0               # 1-based index into hits; 0 = none
     heatmap::Union{Nothing,Matrix{Float32}} = nothing
-    heatmap_min::Float32 = 0.0f0
-    heatmap_max::Float32 = 1.0f0
     status_msg::String = ""
     picker::Union{FilePicker,Nothing} = nothing
+    # CairoMakie render pipeline (reused across frames; surf is the
+    # cache key — nuking it forces a re-render on the next frame).
+    fig::Figure = Figure(size=(0,0))
+    surf::CairoSurfaceImage{RGB24} = CairoImageSurface(RGB24[;;])
+    screen::CairoMakie.Screen = CairoMakie.Screen()
+    img::PixelImage = PixelImage(0,0)
 end
 
 should_quit(m::HitViewerModel) = m.quit
@@ -78,60 +82,17 @@ function _build_table(hits::Vector{HitMetadata})::DataTable
     ], selected=1, show_scrollbar=true)
 end
 
-# ── Heatmap colour mapping ───────────────────────────────────────────
+# ── CairoMakie → Tachikoma pixel bridge ───────────────────────────────
 #
-# A simple viridis-like ramp: dark blue → cyan → green → yellow → red,
-# mapping normalized value [0,1] to an RGB triple. Implementation is
-# piecewise linear interpolation between five anchor colours.
+# Cairo renders into a Matrix{RGB24} in place (via CairoImageSurface's
+# cairo_image_surface_create_for_data). This helper converts each RGB24
+# (packed as 0xffRRGGBB in Cairo's FORMAT_RGB24) to a Tachikoma ColorRGBA
+# for the PixelImage buffer that sixel/kitty/braille rendering reads from.
+# Alpha is 0xff (opaque) for FORMAT_RGB24, so kitty uses efficient RGB mode.
 
-const _HEATMAP_STOPS = (
-    (0.00, (0x00, 0x00, 0x00)),  # black
-    (0.25, (0x1f, 0x0c, 0x48)),  # deep purple
-    (0.50, (0x6a, 0x1b, 0x9a)),  # magenta
-    (0.75, (0xff, 0x6b, 0x1a)),  # orange
-    (1.00, (0xff, 0xff, 0x66)),  # pale yellow
-)
-
-function _heatmap_color(v::Real)::ColorRGBA
-    vf = clamp(Float64(v), 0.0, 1.0)
-    @inbounds for i in 1:(length(_HEATMAP_STOPS) - 1)
-        a = _HEATMAP_STOPS[i]
-        b = _HEATMAP_STOPS[i+1]
-        if vf ≤ b[1]
-            t = (vf - a[1]) / (b[1] - a[1])
-            ar, ag, ab = a[2]
-            br, bg, bb = b[2]
-            r = clamp(round(Int, ar + t * (br - ar)), 0, 255)
-            g = clamp(round(Int, ag + t * (bg - ag)), 0, 255)
-            bl = clamp(round(Int, ab + t * (bb - ab)), 0, 255)
-            return ColorRGBA(UInt8(r), UInt8(g), UInt8(bl))
-        end
-    end
-    ColorRGBA(_HEATMAP_STOPS[end][2]...)
-end
-
-"Build a ColorRGBA matrix (pixel_h × pixel_w) from the heatmap data by
-nearest-neighbour sampling, with one pixel per data cell when the canvas
-is small, and 1:1 mapping when large. Orientation: timesteps run along
-the heatmap's vertical axis (time advances downward, py=1 is the
-earliest timestep), channels along the horizontal axis (px=1 is the
-lowest-frequency channel)."
-function _heatmap_to_pixels(data::Matrix{Float32}, vmin::Float32, vmax::Float32,
-                            pw::Int, ph::Int)::Matrix{ColorRGBA}
-    nch, nt = size(data)
-    out = fill(canvas_bg(), ph, pw)
-    span = vmax > vmin ? Float64(vmax - vmin) : 1.0
-    @inbounds for py in 1:ph
-        # py=1 → earliest timestep (t=1); py=ph → latest (t=nt)
-        sx = clamp(ceil(Int, (py - 0.5) / ph * nt + 0.5), 1, nt)
-        for px in 1:pw
-            # px=1 → lowest-frequency channel (c=1); px=pw → highest (c=nch)
-            sy = clamp(ceil(Int, (px - 0.5) / pw * nch + 0.5), 1, nch)
-            v = (data[sy, sx] - vmin) / span
-            out[py, px] = _heatmap_color(v)
-        end
-    end
-    out
+function colorrgba(rgb24::RGB24)
+    a, r, g, b = (rgb24.color .>> (24, 16, 8, 0)) .% UInt8
+    ColorRGBA(r, g, b, a)
 end
 
 # ── Heatmap loading / caching ────────────────────────────────────────
@@ -150,9 +111,10 @@ function _load_heatmap!(m::HitViewerModel)
     try
         data = load_hit_data(m.path, hit)
         m.heatmap = data
-        m.heatmap_min = isempty(data) ? 0.0f0 : Float32(minimum(data))
-        m.heatmap_max = isempty(data) ? 1.0f0 : Float32(maximum(data))
         m.current_idx = idx
+        # Nuke the Cairo surface to force a re-render on the next frame
+        # (data changed, even if the area size didn't).
+        m.surf = CairoImageSurface(RGB24[;;])
         m.status_msg = "loaded hit $idx: $(size(data,1)) channels × $(size(data,2)) timesteps"
     catch e
         m.heatmap = nothing
@@ -279,11 +241,10 @@ end
 function _render_heatmap(m::HitViewerModel, area::Rect, f::Frame)
     buf = f.buffer
 
-    # Block + title
-    block = Block(title="Heatmap (time ↓, channels →)",
-                  border_style=tstyle(:border),
-                  title_style=tstyle(:title))
-    inner = render(block, area, buf)
+    # No surrounding Block: Makie renders its own title/axes/border inside
+    # the image, so give it the full area (N2=b). Just clear the border
+    # cells with the background so no stale text leaks through.
+    inner = area
 
     # If no hit is selected, just clear interior with a hint
     if m.heatmap === nothing
@@ -296,52 +257,75 @@ function _render_heatmap(m::HitViewerModel, area::Rect, f::Frame)
         return
     end
 
-    data = m.heatmap
-    nch, nt = size(data)
-
-    # Split inner into the pixel canvas area + a small info strip below.
-    info_h = 3
-    if inner.height <= info_h + 1
-        # Too short for an info strip — use the whole inner area
-        _draw_pixel_heatmap(m, data, inner, f)
-        return
-    end
-    rows = split_layout(Layout(Vertical, [Fill(), Fixed(info_h)]), inner)
-    _draw_pixel_heatmap(m, data, rows[1], f)
-    _draw_heatmap_info(m, data, rows[2], buf)
+    _draw_pixel_heatmap(m, m.heatmap, inner, f)
 end
 
+# Render the heatmap via CairoMakie directly into a Matrix{RGB24}
+# (Cairo writes into the Julia-owned matrix in place via
+# cairo_image_surface_create_for_data), then copy to a Tachikoma
+# PixelImage for sixel/kitty/braille output. No PNG round-trip.
+#
+# Caching: `m.surf.data` is the cache key. If its size matches the
+# requested area's pixel dims, the previous render is reused (cache hit
+# → just re-emit the PixelImage). Cache is invalidated by resetting
+# `m.surf = CairoImageSurface(RGB24[;;])` whenever the underlying data
+# changes (hit selection, file load).
 function _draw_pixel_heatmap(m::HitViewerModel, data::Matrix{Float32}, area::Rect, f::Frame)
-    if area.width < 2 || area.height < 2
-        return
+    (area.width < 2 || area.height < 2) && return
+
+    sz = Tachikoma._pixelimage_pixel_dims(area.width, area.height)
+    # Cache hit: size unchanged and surface still valid → reuse m.img.
+    if sz != size(m.surf.data)
+        # Cache miss: rebuild figure, surface, and pixel image.
+        nch, nt = size(data)
+        hitidx = m.table.selected
+        hit = (hitidx > 0 && hitidx ≤ length(m.hits)) ? m.hits[hitidx] : nothing
+
+        # Title/subtitle with hit metadata (N3=frequency/time).
+        title = hit === nothing ? "Heatmap" :
+                "$(hit.sourceName) │ Hit $(hitidx)"
+        subtitle = hit === nothing ? "" :
+                   "DR $(round(hit.driftRate; digits=3)) │ SNR $(round(Float64(hit.snr); digits=2)) │ Freq $(round(hit.frequency; digits=3)) Hz"
+
+        # Pass data (nch × nt) directly to heatmap! — no permutedims, no
+        # explicit x/y vectors. Makie puts size(z,1) on x (channels→) and
+        # size(z,2) on y (timesteps, yreversed → time↓). Ticks default to
+        # channel/timestep indices; we relabel them in physical units
+        # (MHz, s) via tick formatters so the underlying bin geometry
+        # stays on the integer grid (no floating-point edge computation
+        # for tightly-spaced channel frequencies).
+        m.fig = Figure(; size=sz)
+        ax = Axis(m.fig[1,1]; yreversed=true,
+            title=title, subtitle=subtitle,
+            xlabel="Frequency (MHz)", ylabel="Time (s)")
+        heatmap!(ax, data; colormap=:viridis)
+
+        # Relabel ticks: x = channel index → fch1 + (i-1)*foff (MHz),
+        # y = timestep index → (i-1)*tsamp (s). Using Makie's tick
+        # formatter preserves the integer-grid bin layout while showing
+        # physical units to the user.
+        if hit !== nothing
+            fch1, foff, tsamp = hit.fch1, hit.foff, hit.tsamp
+            ax.xtickformat = xs -> [string(round(fch1 + (x - 1) * foff;
+                                                digits=6)) for x in xs]
+            ax.ytickformat = ys -> [string(round((y - 1) * tsamp;
+                                                digits=3)) for y in ys]
+        end
+
+        # Draw into the in-place RGB24 matrix.
+        m.surf = CairoImageSurface(Matrix{RGB24}(undef, sz))
+        conf = Makie.merge_screen_config(CairoMakie.ScreenConfig,
+                                         Dict(:px_per_unit => 1))
+        m.screen = CairoMakie.Screen(m.fig.scene, conf, m.surf)
+        CairoMakie.cairo_draw(m.screen, m.fig.scene)
+
+        # Copy RGB24 → ColorRGBA + transpose (Cairo is (w,h), Tachikoma is (h,w)).
+        m.img = PixelImage(area.width, area.height)
+        map!(colorrgba, m.img.pixels, PermutedDimsArray(m.surf.data, (2,1)))
     end
-    img = PixelImage(area.width, area.height)
-    pixels = _heatmap_to_pixels(data, m.heatmap_min, m.heatmap_max,
-                                img.pixel_w, img.pixel_h)
-    # Push the pixels into the image buffer directly.
-    copyto!(img.pixels, pixels)
-    # render(img, ..., f) dispatches to encode_kitty / encode_sixel based on
-    # GRAPHICS_PROTOCOL[] (set by Tachikoma's enter_tui! from terminal probing
-    # or the TACHIKOMA_GFX env var), falling back to braille on gfx_none.
-    render(img, area, f; tick=m.tick)
-end
 
-function _draw_heatmap_info(m::HitViewerModel, data::Matrix{Float32}, area::Rect, buf::Buffer)
-    nch, nt = size(data)
-    hit = m.table.selected > 0 && m.table.selected ≤ length(m.hits) ? m.hits[m.table.selected] : nothing
-
-    line1 = if hit !== nothing
-        "fch1=$(round(hit.fch1; digits=4))  foff=$(round(hit.foff; digits=8))  tsamp=$(round(hit.tsamp; digits=6))"
-    else
-        ""
-    end
-    line2 = "min=$(round(Float64(m.heatmap_min); digits=4))  max=$(round(Float64(m.heatmap_max); digits=4))  " *
-            "channels=$nch  timesteps=$nt"
-    line3 = "range: $(m.heatmap_min) → $(m.heatmap_max)"
-
-    set_string!(buf, area.x, area.y, line1, tstyle(:text_dim); max_x=right(area))
-    set_string!(buf, area.x, area.y + 1, line2, tstyle(:text); max_x=right(area))
-    set_string!(buf, area.x, area.y + 2, line3, tstyle(:text_dim); max_x=right(area))
+    # Emit via the detected graphics protocol (sixel/kitty/braille).
+    render(m.img, area, f; tick=m.tick)
 end
 
 # ── Status bar ───────────────────────────────────────────────────────
@@ -412,8 +396,7 @@ function _load_file!(m::HitViewerModel, path::AbstractString)::Bool
         m.table = _build_table(hits)
         m.current_idx = 0
         m.heatmap = nothing
-        m.heatmap_min = 0.0f0
-        m.heatmap_max = 1.0f0
+        m.surf = CairoImageSurface(RGB24[;;])  # invalidate render cache
         if !isempty(hits)
             _load_heatmap!(m)
         else
