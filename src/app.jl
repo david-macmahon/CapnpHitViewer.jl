@@ -34,7 +34,6 @@
     tick::Int = 0
     mode::Symbol = :view               # :view or :browse
     path::String = ""                  # hits file path (empty if none loaded yet)
-    schema_path::String = ""           # schema file path (empty = auto)
     hits::Vector{HitMetadata} = HitMetadata[]
     # DataTable over `hits`
     table::DataTable = DataTable(DataColumn[])
@@ -149,7 +148,7 @@ function _load_heatmap!(m::HitViewerModel)
     end
     hit = m.hits[idx]
     try
-        data = load_hit_data(m.path, hit; schema_path=isempty(m.schema_path) ? nothing : m.schema_path)
+        data = load_hit_data(m.path, hit)
         m.heatmap = data
         m.heatmap_min = isempty(data) ? 0.0f0 : Float32(minimum(data))
         m.heatmap_max = isempty(data) ? 1.0f0 : Float32(maximum(data))
@@ -407,8 +406,7 @@ state. Returns true on success, false on error (with status_msg set)."
 function _load_file!(m::HitViewerModel, path::AbstractString)::Bool
     try
         abs_path = abspath(path)
-        schema = isempty(m.schema_path) ? nothing : m.schema_path
-        hits = scan_hits(abs_path; schema_path=schema)
+        hits = scan_hits(abs_path)
         m.path = abs_path
         m.hits = hits
         m.table = _build_table(hits)
@@ -431,17 +429,18 @@ end
 # ── Public entry point ───────────────────────────────────────────────
 
 """
-    run_viewer([path]; schema_path=nothing, theme_name=nothing, gfx=nothing,
-               start_dir=pwd())
+    run_viewer([path]; theme_name=nothing, gfx=nothing, start_dir=pwd())
 
 Open a Tachikoma TUI showing the hits in `path` (a seticore `.hits`
 file). If `path` is omitted, the app starts in browse mode at
 `start_dir` (default: the working directory) so the user can navigate
 the filesystem and pick a `.hits` file.
 
-`schema_path` defaults to `seticore.capnp` in the cwd or next to the
-package. Pass `theme_name` (e.g. `:NEUROMANCER`) to override the default
-theme.
+The seticore Cap'n Proto schema is embedded in the package as
+`SETICORE_SCHEMA_TEXT` and parsed once per session in `__init__` into
+the `SETICORE_SCHEMA` Ref; no external schema file is needed.
+
+Pass `theme_name` (e.g. `:NEUROMANCER`) to override the default theme.
 
 The heatmap is rendered via the terminal's native graphics protocol —
 Kitty graphics on Kitty/Ghostty, Sixel on WezTerm/iTerm2/foot/mlterm —
@@ -462,7 +461,6 @@ In view mode, press `o` to open the file picker and switch to another
 `.hits` file without restarting the app.
 """
 function run_viewer(path::Union{Nothing,AbstractString}=nothing;
-                    schema_path=nothing,
                     theme_name=nothing,
                     gfx=nothing,
                     start_dir::AbstractString=pwd())
@@ -478,9 +476,7 @@ function run_viewer(path::Union{Nothing,AbstractString}=nothing;
     end
 
     try
-        m = HitViewerModel(;
-            schema_path = schema_path === nothing ? "" : abspath(schema_path),
-        )
+        m = HitViewerModel()
 
         if path !== nothing
             abs_path = abspath(path)

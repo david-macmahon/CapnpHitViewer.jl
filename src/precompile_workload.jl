@@ -3,7 +3,7 @@
 # The single biggest user-facing latency is Julia compiling methods on
 # the first call.  Measured cold costs (precompile cache cleared):
 #
-#   parse_schema_file           ~1300 ms   (schema parser)
+#   parse_schema                ~1300 ms   (schema parser)
 #   first iterate(MessageIterator) ~2000 ms   (parse_messages + read_struct)
 #   load_hit_data / parse_message   ~730 ms
 #   _build_table (DataTable ctor)   ~550 ms
@@ -18,6 +18,11 @@
 # `Pkg.precompile`/install time.  The workload below builds a tiny
 # synthetic `.hits` file in a temp directory using CapnProto.build_message
 # so it works on any machine without external sample data.
+#
+# Note: `__init__` does NOT run during precompilation, so `SETICORE_SCHEMA[]`
+# is empty here.  The workload parses `SETICORE_SCHEMA_TEXT` directly (which
+# is exactly what `__init__` will do at runtime) and populates the Ref for
+# the duration of the workload so the reader functions work.
 
 "Build a single minimal Hit message as a packed Cap'n Proto byte vector."
 function _make_synthetic_hit(sf::SchemaFile, frequency::Float64)::Vector{UInt8}
@@ -67,74 +72,68 @@ function _write_synthetic_hits(sf::SchemaFile, n::Int=3)::String
 end
 
 @compile_workload begin
-    # Locate the bundled schema (this file is src/precompile_workload.jl,
-    # so the schema is one directory up).
-    schema_path = joinpath(@__DIR__, "seticore.capnp")
-    isfile(schema_path) || (schema_path = joinpath(@__DIR__, "..", "seticore.capnp"))
+    # parse_schema on the embedded text — same call __init__ will make at
+    # runtime (~1300 ms cold). This compiles parse_schema and the lexer/
+    # parser internals.
+    sf = parse_schema(SETICORE_SCHEMA_TEXT)
 
-    # No schema available — skip the workload. Precompilation will
-    # still happen on first use; the workload is a best-effort optimisation.
-    if isfile(schema_path)
-        # ── Reader / Cap'n Proto path ──────────────────────────────────
-        # parse_schema_file (~1300 ms cold)
-        sf = parse_schema_file(schema_path)
+    # Populate the Ref so scan_hits / load_hit_data (which read
+    # SETICORE_SCHEMA[]) work during the workload. __init__ will
+    # unconditionally overwrite this at runtime, so no cleanup needed.
+    SETICORE_SCHEMA[] = sf
 
-        # Write a tiny synthetic .hits file and scan it.
-        # parse_messages + first iterate (~2000 ms cold) + _to_metadata
-        tmp_hits = _write_synthetic_hits(sf, 3)
-        try
-            hits = scan_hits(tmp_hits; schema_path=schema_path)
-            if !isempty(hits)
-                # load_hit_data / parse_message + reshape (~730 ms cold)
-                data = load_hit_data(tmp_hits, hits[1]; schema_path=schema_path)
+    # Write a tiny synthetic .hits file and scan it.
+    # parse_messages + first iterate (~2000 ms cold) + _to_metadata
+    tmp_hits = _write_synthetic_hits(sf, 3)
+    try
+        hits = scan_hits(tmp_hits)
+        if !isempty(hits)
+            # load_hit_data / parse_message + reshape (~730 ms cold)
+            data = load_hit_data(tmp_hits, hits[1])
 
-                # ── Table / heatmap path ────────────────────────────────
-                # _build_table / DataTable ctor (~550 ms cold)
-                table = _build_table(hits)
+            # ── Table / heatmap path ────────────────────────────────
+            # _build_table / DataTable ctor (~550 ms cold)
+            table = _build_table(hits)
 
-                # _heatmap_to_pixels inner loop + _heatmap_color (~190 ms cold)
-                vmin = Float32(minimum(data))
-                vmax = Float32(maximum(data))
-                _heatmap_to_pixels(data, vmin, vmax, 80, 30)
+            # _heatmap_to_pixels inner loop + _heatmap_color (~190 ms cold)
+            vmin = Float32(minimum(data))
+            vmax = Float32(maximum(data))
+            _heatmap_to_pixels(data, vmin, vmax, 80, 30)
 
-                # ── FilePicker ctor (~720 ms cold) ──────────────────────
-                # Use dirname(tmp_hits) so the picker sees a real directory.
-                FilePicker(start_dir=dirname(tmp_hits))
+            # ── FilePicker ctor (~720 ms cold) ──────────────────────
+            # Use dirname(tmp_hits) so the picker sees a real directory.
+            FilePicker(start_dir=dirname(tmp_hits))
 
-                # ── Full view + update path through TestBackend ─────────
-                # Pulls in render(::DataTable), render(::PixelImage, ::Rect, ::Frame)
-                # (the braille fallback, ~2300 ms cold), render(::StatusBar),
-                # render(::Block), set_string!, handle_key!(::DataTable),
-                # and update! (~140 ms cold).
-                tb = Tachikoma.TestBackend(120, 40)
-                f = Tachikoma.Frame(tb.buf,
-                                    Tachikoma.Rect(1, 1, 120, 40),
-                                    Tachikoma.GraphicsRegion[],
-                                    Tachikoma.PixelSnapshot[])
-                m = HitViewerModel(path=tmp_hits,
-                                   schema_path=abspath(schema_path),
-                                   hits=hits,
-                                   table=table)
-                _load_heatmap!(m)
-                # view mode render
-                view(m, f)
-                # browse mode render (picker path)
-                _open_picker!(m; start_dir=dirname(tmp_hits))
-                view(m, f)
-                # update! paths: navigate in view mode
-                m.mode = :view
-                m.picker = nothing
-                update!(m, Tachikoma.KeyEvent(:down, Char(0)))
-                update!(m, Tachikoma.KeyEvent(:char, 'r'))
-                # update! path: picker key handling
-                _open_picker!(m; start_dir=dirname(tmp_hits))
-                update!(m, Tachikoma.KeyEvent(:enter, Char(0)))
-                update!(m, Tachikoma.KeyEvent(:backspace, Char(0)))
-                update!(m, Tachikoma.KeyEvent(:char, 'h'))
-                update!(m, Tachikoma.KeyEvent(:escape, Char(0)))
-            end
-        finally
-            isfile(tmp_hits) && rm(tmp_hits; force=true)
+            # ── Full view + update path through TestBackend ─────────
+            # Pulls in render(::DataTable), render(::PixelImage, ::Rect, ::Frame)
+            # (the braille fallback, ~2300 ms cold), render(::StatusBar),
+            # render(::Block), set_string!, handle_key!(::DataTable),
+            # and update! (~140 ms cold).
+            tb = Tachikoma.TestBackend(120, 40)
+            f = Tachikoma.Frame(tb.buf,
+                                Tachikoma.Rect(1, 1, 120, 40),
+                                Tachikoma.GraphicsRegion[],
+                                Tachikoma.PixelSnapshot[])
+            m = HitViewerModel(path=tmp_hits, hits=hits, table=table)
+            _load_heatmap!(m)
+            # view mode render
+            view(m, f)
+            # browse mode render (picker path)
+            _open_picker!(m; start_dir=dirname(tmp_hits))
+            view(m, f)
+            # update! paths: navigate in view mode
+            m.mode = :view
+            m.picker = nothing
+            update!(m, Tachikoma.KeyEvent(:down, Char(0)))
+            update!(m, Tachikoma.KeyEvent(:char, 'r'))
+            # update! path: picker key handling
+            _open_picker!(m; start_dir=dirname(tmp_hits))
+            update!(m, Tachikoma.KeyEvent(:enter, Char(0)))
+            update!(m, Tachikoma.KeyEvent(:backspace, Char(0)))
+            update!(m, Tachikoma.KeyEvent(:char, 'h'))
+            update!(m, Tachikoma.KeyEvent(:escape, Char(0)))
         end
+    finally
+        isfile(tmp_hits) && rm(tmp_hits; force=true)
     end
 end
