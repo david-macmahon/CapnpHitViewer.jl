@@ -2,6 +2,7 @@ module CapnpHitViewer
 
 using CapnProto
 using Tachikoma
+using PrecompileTools: @compile_workload
 import Tachikoma: view, update!, should_quit, init!, cleanup!,
                  handle_all_key_actions, copy_rect, task_queue,
                  recording_enabled, has_pending_output, set_wake!
@@ -47,5 +48,6 @@ end
 include("reader.jl")
 include("filepicker.jl")
 include("app.jl")
+include("precompile_workload.jl")
 
 end # module
