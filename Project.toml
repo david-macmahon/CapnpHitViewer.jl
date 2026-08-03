@@ -1,0 +1,8 @@
+name = "CapnpHitViewer"
+uuid = "6e6df8c0-dba9-49be-9fd3-d4a0ef72fecc"
+version = "0.1.0"
+authors = ["David MacMahon <davidm@astro.berkeley.edu>"]
+
+[deps]
+CapnProto = "8ce9df8c-dba9-49be-9fd3-d4a0ef72fecc"
+Tachikoma = "468859d6-42d8-48b7-8ad9-1d312e0e3b0a"
