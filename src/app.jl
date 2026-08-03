@@ -1,6 +1,6 @@
 # app.jl ── Tachikoma TUI for browsing seticore .hits files.
 #
-# Layout:
+# Layout (view mode):
 #   ┌───────────────────────────────────────────────────────────┐
 #   │ title bar                                                  │
 #   ├──────────────────────┬────────────────────────────────────┤
@@ -12,25 +12,39 @@
 #   │ status bar / keybindings                                   │
 #   └───────────────────────────────────────────────────────────┘
 #
-# Keys:
+# Browse mode (file picker) replaces the body with a directory listing
+# so the user can navigate the filesystem and pick a .hits file.
+#
+# Keys (view mode):
 #   ↑/↓/PgUp/PgDn/Home/End  navigate hits (heatmap auto-reloads)
+#   o     open file picker (browse mode)
 #   r     reload data for current hit (re-reads the capnp message)
 #   q/Esc quit
+#
+# Keys (browse mode):
+#   ↑/↓/PgUp/PgDn/Home/End  navigate entries
+#   Enter  descend into directory / select .hits file
+#   ⌫      parent directory
+#   h      toggle hidden files
+#   r      refresh listing
+#   Esc/q  cancel (return to viewer, or quit if no file loaded)
 
 @kwdef mutable struct HitViewerModel <: Model
     quit::Bool = false
     tick::Int = 0
-    path::String = ""                  # hits file path
+    mode::Symbol = :view               # :view or :browse
+    path::String = ""                  # hits file path (empty if none loaded yet)
     schema_path::String = ""           # schema file path (empty = auto)
     hits::Vector{HitMetadata} = HitMetadata[]
     # DataTable over `hits`
-    table::DataTable = DataTable(String[], Any[])
+    table::DataTable = DataTable(DataColumn[])
     # Cached heatmap data for the currently selected hit
     current_idx::Int = 0               # 1-based index into hits; 0 = none
     heatmap::Union{Nothing,Matrix{Float32}} = nothing
     heatmap_min::Float32 = 0.0f0
     heatmap_max::Float32 = 1.0f0
     status_msg::String = ""
+    picker::Union{FilePicker,Nothing} = nothing
 end
 
 should_quit(m::HitViewerModel) = m.quit
@@ -151,6 +165,14 @@ end
 # ── Event handling ───────────────────────────────────────────────────
 
 function update!(m::HitViewerModel, evt::KeyEvent)
+    if m.mode == :browse && m.picker !== nothing
+        _picker_handle_key!(m.picker, evt)
+        return
+    end
+    _update_view!(m, evt)
+end
+
+function _update_view!(m::HitViewerModel, evt::KeyEvent)
     # Delegate to the table for navigation/sort/etc.
     if m.table.show_detail
         handle_key!(m.table, evt)
@@ -165,6 +187,10 @@ function update!(m::HitViewerModel, evt::KeyEvent)
             _load_heatmap!(m)
             return
         end
+        evt.char == 'o' && begin
+            _open_picker!(m)
+            return
+        end
     end
     evt.key == :escape && (m.quit = true; return)
 
@@ -177,6 +203,10 @@ function update!(m::HitViewerModel, evt::KeyEvent)
 end
 
 function update!(m::HitViewerModel, evt::MouseEvent)
+    if m.mode == :browse && m.picker !== nothing
+        _picker_handle_mouse!(m.picker, evt)
+        return
+    end
     # Forward to the table for click-to-select / scroll
     prev = m.table.selected
     handle_mouse!(m.table, evt)
@@ -189,6 +219,14 @@ end
 
 function view(m::HitViewerModel, f::Frame)
     m.tick += 1
+    if m.mode == :browse && m.picker !== nothing
+        _render_picker(m.picker, f)
+        return
+    end
+    _render_view(m, f)
+end
+
+function _render_view(m::HitViewerModel, f::Frame)
     buf = f.buffer
 
     # Layout: 1 (title) / fill / 1 (status)
@@ -315,21 +353,95 @@ function _render_footer(m::HitViewerModel, area::Rect, buf::Buffer)
         status = isempty(m.hits) ? "no hits loaded" : "ready"
     end
     render(StatusBar(
-        left=[Span("  [↑↓]navigate [r]reload [q/Esc]quit ",
+        left=[Span("  [↑↓]navigate [o]open file [r]reload [q/Esc]quit ",
                     tstyle(:text_dim))],
         right=[Span(status, tstyle(:accent, bold=true))],
     ), area, buf)
 end
 
+# ── Picker open / close / file loading ───────────────────────────────
+
+"Open the file picker, rooted at `start_dir` (defaults to the directory
+of the current file if one is loaded, else the working directory)."
+function _open_picker!(m::HitViewerModel; start_dir::Union{Nothing,AbstractString}=nothing)
+    dir = if start_dir !== nothing
+        start_dir
+    elseif !isempty(m.path) && isfile(m.path)
+        dirname(m.path)
+    else
+        pwd()
+    end
+    m.picker = FilePicker(;
+        start_dir=dir,
+        on_select=path -> _on_picker_select!(m, path),
+        on_cancel=() -> _on_picker_cancel!(m),
+    )
+    m.mode = :browse
+end
+
+"Close the picker and return to view mode. If no file is loaded, quit."
+function _close_picker!(m::HitViewerModel)
+    m.picker = nothing
+    m.mode = :view
+    if isempty(m.path)
+        # Nothing to view — quit the app.
+        m.quit = true
+    end
+end
+
+"Callback invoked by the picker when the user selects a .hits file."
+function _on_picker_select!(m::HitViewerModel, path::AbstractString)
+    if _load_file!(m, path)
+        m.picker = nothing
+        m.mode = :view
+    end
+end
+
+"Callback invoked by the picker on cancel (Esc/q)."
+function _on_picker_cancel!(m::HitViewerModel)
+    _close_picker!(m)
+end
+
+"Load a .hits file: scan metadata, rebuild the table, reset heatmap
+state. Returns true on success, false on error (with status_msg set)."
+function _load_file!(m::HitViewerModel, path::AbstractString)::Bool
+    try
+        abs_path = abspath(path)
+        schema = isempty(m.schema_path) ? nothing : m.schema_path
+        hits = scan_hits(abs_path; schema_path=schema)
+        m.path = abs_path
+        m.hits = hits
+        m.table = _build_table(hits)
+        m.current_idx = 0
+        m.heatmap = nothing
+        m.heatmap_min = 0.0f0
+        m.heatmap_max = 1.0f0
+        if !isempty(hits)
+            _load_heatmap!(m)
+        else
+            m.status_msg = "no hits in $path"
+        end
+        return true
+    catch e
+        m.status_msg = "error loading $path: $(typeof(e).__name__) $(e)"
+        return false
+    end
+end
+
 # ── Public entry point ───────────────────────────────────────────────
 
 """
-    run_viewer(path; schema_path=nothing, theme_name=nothing, gfx=nothing)
+    run_viewer([path]; schema_path=nothing, theme_name=nothing, gfx=nothing,
+               start_dir=pwd())
 
 Open a Tachikoma TUI showing the hits in `path` (a seticore `.hits`
-file). `schema_path` defaults to `seticore.capnp` in the cwd or next
-to the package. Pass `theme_name` (e.g. `:NEUROMANCER`) to override the
-default theme.
+file). If `path` is omitted, the app starts in browse mode at
+`start_dir` (default: the working directory) so the user can navigate
+the filesystem and pick a `.hits` file.
+
+`schema_path` defaults to `seticore.capnp` in the cwd or next to the
+package. Pass `theme_name` (e.g. `:NEUROMANCER`) to override the default
+theme.
 
 The heatmap is rendered via the terminal's native graphics protocol —
 Kitty graphics on Kitty/Ghostty, Sixel on WezTerm/iTerm2/foot/mlterm —
@@ -345,12 +457,16 @@ Pass `gfx` to force a specific protocol for this run:
 `gfx` is implemented by setting the `TACHIKOMA_GFX` environment variable
 for the duration of the app, so it takes effect before Tachikoma's
 terminal probe runs.
-"""
-function run_viewer(path::AbstractString; schema_path=nothing, theme_name=nothing, gfx=nothing)
-    theme_name !== nothing && set_theme!(theme_name)
 
-    abs_path = abspath(path)
-    isfile(abs_path) || error("hits file not found: $abs_path")
+In view mode, press `o` to open the file picker and switch to another
+`.hits` file without restarting the app.
+"""
+function run_viewer(path::Union{Nothing,AbstractString}=nothing;
+                    schema_path=nothing,
+                    theme_name=nothing,
+                    gfx=nothing,
+                    start_dir::AbstractString=pwd())
+    theme_name !== nothing && set_theme!(theme_name)
 
     # Force a graphics protocol for this run by setting the env var that
     # Tachikoma's `enter_tui!` honors before probing the terminal. We save
@@ -362,18 +478,17 @@ function run_viewer(path::AbstractString; schema_path=nothing, theme_name=nothin
     end
 
     try
-        # First pass: scan all hit metadata (skipping the heavy data field).
-        hits = scan_hits(abs_path; schema_path=schema_path)
-        table = _build_table(hits)
+        m = HitViewerModel(;
+            schema_path = schema_path === nothing ? "" : abspath(schema_path),
+        )
 
-        m = HitViewerModel(path=abs_path,
-                           schema_path=schema_path === nothing ? "" : abspath(schema_path),
-                           hits=hits,
-                           table=table)
-
-        # Load the heatmap for the initially selected hit.
-        if !isempty(hits)
-            _load_heatmap!(m)
+        if path !== nothing
+            abs_path = abspath(path)
+            isfile(abs_path) || error("hits file not found: $abs_path")
+            _load_file!(m, abs_path)
+        else
+            # No path supplied: start in browse mode.
+            _open_picker!(m; start_dir=start_dir)
         end
 
         app(m; fps=30)

@@ -7,7 +7,6 @@ import Tachikoma: view, update!, should_quit, init!, cleanup!,
                  recording_enabled, has_pending_output, set_wake!
 
 export run_viewer, HitMetadata
-
 """
     HitMetadata
 
@@ -46,6 +45,7 @@ struct HitMetadata
 end
 
 include("reader.jl")
+include("filepicker.jl")
 include("app.jl")
 
 end # module
