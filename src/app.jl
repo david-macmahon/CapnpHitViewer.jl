@@ -99,18 +99,21 @@ end
 
 "Build a ColorRGBA matrix (pixel_h × pixel_w) from the heatmap data by
 nearest-neighbour sampling, with one pixel per data cell when the canvas
-is small, and 1:1 mapping when large. Orientation: channels (rows of the
-data matrix) run along the heatmap's vertical axis, timesteps along the
-horizontal axis."
+is small, and 1:1 mapping when large. Orientation: timesteps run along
+the heatmap's vertical axis (time advances downward, py=1 is the
+earliest timestep), channels along the horizontal axis (px=1 is the
+lowest-frequency channel)."
 function _heatmap_to_pixels(data::Matrix{Float32}, vmin::Float32, vmax::Float32,
                             pw::Int, ph::Int)::Matrix{ColorRGBA}
     nch, nt = size(data)
     out = fill(canvas_bg(), ph, pw)
     span = vmax > vmin ? Float64(vmax - vmin) : 1.0
     @inbounds for py in 1:ph
-        sy = clamp(ceil(Int, (py - 0.5) / ph * nch + 0.5), 1, nch)
+        # py=1 → earliest timestep (t=1); py=ph → latest (t=nt)
+        sx = clamp(ceil(Int, (py - 0.5) / ph * nt + 0.5), 1, nt)
         for px in 1:pw
-            sx = clamp(ceil(Int, (px - 0.5) / pw * nt + 0.5), 1, nt)
+            # px=1 → lowest-frequency channel (c=1); px=pw → highest (c=nch)
+            sy = clamp(ceil(Int, (px - 0.5) / pw * nch + 0.5), 1, nch)
             v = (data[sy, sx] - vmin) / span
             out[py, px] = _heatmap_color(v)
         end
@@ -240,7 +243,7 @@ function _render_heatmap(m::HitViewerModel, area::Rect, f::Frame)
     buf = f.buffer
 
     # Block + title
-    block = Block(title="Heatmap (channels ↑, timesteps →)",
+    block = Block(title="Heatmap (time ↓, channels →)",
                   border_style=tstyle(:border),
                   title_style=tstyle(:title))
     inner = render(block, area, buf)
@@ -280,6 +283,9 @@ function _draw_pixel_heatmap(m::HitViewerModel, data::Matrix{Float32}, area::Rec
                                 img.pixel_w, img.pixel_h)
     # Push the pixels into the image buffer directly.
     copyto!(img.pixels, pixels)
+    # render(img, ..., f) dispatches to encode_kitty / encode_sixel based on
+    # GRAPHICS_PROTOCOL[] (set by Tachikoma's enter_tui! from terminal probing
+    # or the TACHIKOMA_GFX env var), falling back to braille on gfx_none.
     render(img, area, f; tick=m.tick)
 end
 
@@ -318,32 +324,73 @@ end
 # ── Public entry point ───────────────────────────────────────────────
 
 """
-    run_viewer(path; schema_path=nothing, theme_name=nothing)
+    run_viewer(path; schema_path=nothing, theme_name=nothing, gfx=nothing)
 
 Open a Tachikoma TUI showing the hits in `path` (a seticore `.hits`
 file). `schema_path` defaults to `seticore.capnp` in the cwd or next
 to the package. Pass `theme_name` (e.g. `:NEUROMANCER`) to override the
 default theme.
+
+The heatmap is rendered via the terminal's native graphics protocol —
+Kitty graphics on Kitty/Ghostty, Sixel on WezTerm/iTerm2/foot/mlterm —
+falling back to braille sampling on terminals without one. Tachikoma
+auto-detects the protocol during startup.
+
+Pass `gfx` to force a specific protocol for this run:
+  - `:kitty`  → Kitty graphics protocol
+  - `:sixel`  → Sixel
+  - `:none`   → braille fallback only
+  - `nothing` → auto-detect (default)
+
+`gfx` is implemented by setting the `TACHIKOMA_GFX` environment variable
+for the duration of the app, so it takes effect before Tachikoma's
+terminal probe runs.
 """
-function run_viewer(path::AbstractString; schema_path=nothing, theme_name=nothing)
+function run_viewer(path::AbstractString; schema_path=nothing, theme_name=nothing, gfx=nothing)
     theme_name !== nothing && set_theme!(theme_name)
 
     abs_path = abspath(path)
     isfile(abs_path) || error("hits file not found: $abs_path")
 
-    # First pass: scan all hit metadata (skipping the heavy data field).
-    hits = scan_hits(abs_path; schema_path=schema_path)
-    table = _build_table(hits)
-
-    m = HitViewerModel(path=abs_path,
-                       schema_path=schema_path === nothing ? "" : abspath(schema_path),
-                       hits=hits,
-                       table=table)
-
-    # Load the heatmap for the initially selected hit.
-    if !isempty(hits)
-        _load_heatmap!(m)
+    # Force a graphics protocol for this run by setting the env var that
+    # Tachikoma's `enter_tui!` honors before probing the terminal. We save
+    # and restore the previous value so callers don't see a leaked env.
+    gfx_sym = _normalize_gfx(gfx)
+    saved_gfx = get(ENV, "TACHIKOMA_GFX", nothing)
+    if gfx_sym !== :auto
+        ENV["TACHIKOMA_GFX"] = string(gfx_sym)
     end
 
-    app(m; fps=30)
+    try
+        # First pass: scan all hit metadata (skipping the heavy data field).
+        hits = scan_hits(abs_path; schema_path=schema_path)
+        table = _build_table(hits)
+
+        m = HitViewerModel(path=abs_path,
+                           schema_path=schema_path === nothing ? "" : abspath(schema_path),
+                           hits=hits,
+                           table=table)
+
+        # Load the heatmap for the initially selected hit.
+        if !isempty(hits)
+            _load_heatmap!(m)
+        end
+
+        app(m; fps=30)
+    finally
+        # Restore the previous TACHIKOMA_GFX value.
+        if saved_gfx === nothing
+            delete!(ENV, "TACHIKOMA_GFX")
+        else
+            ENV["TACHIKOMA_GFX"] = saved_gfx
+        end
+    end
+end
+
+"Map a user-supplied gfx spec to one of :auto, :kitty, :sixel, :none."
+function _normalize_gfx(gfx)
+    gfx === nothing && return :auto
+    gfx isa Symbol && return gfx
+    gfx isa AbstractString && return Symbol(lowercase(gfx))
+    error("gfx must be a Symbol, String, or nothing; got $(typeof(gfx))")
 end
