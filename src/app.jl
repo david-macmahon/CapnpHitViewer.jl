@@ -300,16 +300,48 @@ function _draw_pixel_heatmap(m::HitViewerModel, data::Matrix{Float32}, area::Rec
             xlabel="Frequency Offset (Hz)", ylabel="Time (s)")
         heatmap!(ax, data; colormap=:viridis)
 
-        # Relabel ticks: x = channel index → (fch1 + (i-1)*foff - signal.freq)
-        # * 1e6 to convert the MHz offset to Hz, y = timestep index →
-        # (i-1)*tsamp (s). Using Makie's tick formatter preserves the
-        # integer-grid bin layout while showing physical units to the user.
+        # Relabel ticks in physical units (N3=frequency/time) while keeping
+        # the integer-grid bin layout. For the x-axis, set explicit ticks
+        # at round Hz offsets (including 0) so the axis reads cleanly.
         if hit !== nothing
             fch1, foff, tsamp = hit.fch1, hit.foff, hit.tsamp
             sigfreq_mhz = hit.frequency  # signal.frequency is in MHz (same as fch1/foff)
-            ax.xtickformat = xs -> [string(round((fch1 + (x - 1) * foff
-                                                  - sigfreq_mhz) * 1e6;
-                                                digits=3)) for x in xs]
+            hz_offset(i) = (fch1 + (i - 1) * foff - sigfreq_mhz) * 1e6
+            hz_lo, hz_hi = hz_offset(1), hz_offset(nch)
+            # Pick a nice step (1, 2, 5, 10, 20, 50, ...) giving ~5-10 ticks.
+            R = hz_hi - hz_lo
+            nice = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000,
+                    2000, 5000, 10_000, 20_000, 50_000, 100_000)
+            step = nice[end]
+            for s in nice
+                if R / s ≤ 10
+                    step = s
+                    break
+                end
+            end
+            # Round Hz values in [hz_lo, hz_hi] at multiples of step, incl 0.
+            tick_hz = Int[]
+            t = 0
+            while t ≥ round(Int, floor(hz_lo / step) * step)
+                pushfirst!(tick_hz, t)
+                t -= step
+            end
+            t = step
+            while t ≤ round(Int, ceil(hz_hi / step) * step)
+                push!(tick_hz, t)
+                t += step
+            end
+            # Map each round Hz value back to channel-index position.
+            positions = Float64[]
+            labels = String[]
+            for hz in tick_hz
+                i = (hz / 1e6 + sigfreq_mhz - fch1) / foff + 1
+                if 1 ≤ i ≤ nch
+                    push!(positions, i)
+                    push!(labels, string(hz))
+                end
+            end
+            ax.xticks = (positions, labels)
             ax.ytickformat = ys -> [string(round((y - 1) * tsamp;
                                                 digits=3)) for y in ys]
         end
