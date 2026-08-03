@@ -297,17 +297,19 @@ function _draw_pixel_heatmap(m::HitViewerModel, data::Matrix{Float32}, area::Rec
         m.fig = Figure(; size=sz)
         ax = Axis(m.fig[1,1]; yreversed=true,
             title=title, subtitle=subtitle,
-            xlabel="Frequency (MHz)", ylabel="Time (s)")
+            xlabel="Frequency Offset (Hz)", ylabel="Time (s)")
         heatmap!(ax, data; colormap=:viridis)
 
-        # Relabel ticks: x = channel index → fch1 + (i-1)*foff (MHz),
-        # y = timestep index → (i-1)*tsamp (s). Using Makie's tick
-        # formatter preserves the integer-grid bin layout while showing
-        # physical units to the user.
+        # Relabel ticks: x = channel index → (fch1 + (i-1)*foff - signal.freq)
+        # * 1e6 to convert the MHz offset to Hz, y = timestep index →
+        # (i-1)*tsamp (s). Using Makie's tick formatter preserves the
+        # integer-grid bin layout while showing physical units to the user.
         if hit !== nothing
             fch1, foff, tsamp = hit.fch1, hit.foff, hit.tsamp
-            ax.xtickformat = xs -> [string(round(fch1 + (x - 1) * foff;
-                                                digits=6)) for x in xs]
+            sigfreq_mhz = hit.frequency  # signal.frequency is in MHz (same as fch1/foff)
+            ax.xtickformat = xs -> [string(round((fch1 + (x - 1) * foff
+                                                  - sigfreq_mhz) * 1e6;
+                                                digits=3)) for x in xs]
             ax.ytickformat = ys -> [string(round((y - 1) * tsamp;
                                                 digits=3)) for y in ys]
         end
