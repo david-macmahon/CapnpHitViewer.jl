@@ -17,7 +17,9 @@
 # so the user can navigate the filesystem and pick a .hits file.
 #
 # Keys (view mode):
-#   ↑/↓/PgUp/PgDn/Home/End  navigate hits (heatmap auto-reloads)
+#   ↑/↓/PgUp/PgDn/Home/End  navigate hits
+#   Enter  view selected hit (manual mode) / no-op (auto mode)
+#   m      toggle manual mode (auto-view on nav vs. view-on-Enter)
 #   o     open file picker (browse mode)
 #   r     reload data for current hit (re-reads the capnp message)
 #   q/Esc quit
@@ -38,9 +40,14 @@
     hits::Vector{HitMetadata} = HitMetadata[]
     # DataTable over `hits`
     table::DataTable = DataTable(DataColumn[])
-    # Cached heatmap data for the currently selected hit
+    # Cached heatmap data for the currently *viewed* hit (the one rendered
+    # in the heatmap + metadata panel). In auto mode this tracks the
+    # table selection; in manual mode it only changes on Enter.
     current_idx::Int = 0               # 1-based index into hits; 0 = none
     heatmap::Union{Nothing,Matrix{Float32}} = nothing
+    # Manual mode: when true, navigating the table does NOT auto-load the
+    # heatmap. The viewer only loads a hit when the user presses Enter.
+    manual_mode::Bool = false
     status_msg::String = ""
     picker::Union{FilePicker,Nothing} = nothing
     # CairoMakie render pipeline (reused across frames; surf is the
@@ -52,6 +59,11 @@
 end
 
 should_quit(m::HitViewerModel) = m.quit
+
+# Marker drawn in the table's left margin for the hit currently shown in
+# the heatmap/metadata panel. Distinct from the selection marker (▸) so
+# the two highlights don't clash when they differ (manual mode).
+const VIEWED_MARKER = '●'
 
 # ── Build the DataTable from the hits vector ─────────────────────────
 
@@ -98,8 +110,7 @@ end
 
 # ── Heatmap loading / caching ────────────────────────────────────────
 
-function _load_heatmap!(m::HitViewerModel)
-    idx = m.table.selected
+function _load_heatmap!(m::HitViewerModel, idx::Int=m.table.selected)
     if idx == 0 || idx > length(m.hits)
         m.heatmap = nothing
         m.current_idx = 0
@@ -135,7 +146,8 @@ function update!(m::HitViewerModel, evt::KeyEvent)
 end
 
 function _update_view!(m::HitViewerModel, evt::KeyEvent)
-    # Delegate to the table for navigation/sort/etc.
+    # Delegate to the table for navigation/sort/etc. when the detail view
+    # is open — it intercepts all keys.
     if m.table.show_detail
         handle_key!(m.table, evt)
         return
@@ -144,23 +156,46 @@ function _update_view!(m::HitViewerModel, evt::KeyEvent)
     if evt.key == :char
         evt.char == 'q' && (m.quit = true; return)
         evt.char == 'r' && begin
-            # Force reload
+            # Force reload of the currently viewed hit.
             m.current_idx = 0
-            _load_heatmap!(m)
+            _load_heatmap!(m, m.table.selected)
             return
         end
         evt.char == 'o' && begin
             _open_picker!(m)
             return
         end
+        evt.char == 'm' && begin
+            m.manual_mode = !m.manual_mode
+            if m.manual_mode
+                m.status_msg = "manual mode: press Enter to view selected hit"
+            else
+                m.status_msg = "auto mode: heatmap follows selection"
+                # Loading the selected hit brings the viewed hit in sync
+                # with the cursor when leaving manual mode.
+                if m.table.selected != m.current_idx
+                    _load_heatmap!(m, m.table.selected)
+                end
+            end
+            return
+        end
     end
     evt.key == :escape && (m.quit = true; return)
 
-    # Let the table handle navigation; reload heatmap if selection changed.
+    # Enter loads the selected hit in manual mode (no-op in auto mode,
+    # where navigation already loads it).
+    if evt.key == :enter && m.manual_mode
+        _load_heatmap!(m, m.table.selected)
+        return
+    end
+
+    # Let the table handle navigation; in auto mode, reload the heatmap
+    # when the selection changes. In manual mode, navigation only moves
+    # the selection cursor — the viewed hit is unchanged until Enter.
     prev = m.table.selected
     handled = handle_key!(m.table, evt)
-    if handled && m.table.selected != prev
-        _load_heatmap!(m)
+    if handled && !m.manual_mode && m.table.selected != prev
+        _load_heatmap!(m, m.table.selected)
     end
 end
 
@@ -169,11 +204,13 @@ function update!(m::HitViewerModel, evt::MouseEvent)
         _picker_handle_mouse!(m.picker, evt)
         return
     end
-    # Forward to the table for click-to-select / scroll
+    # Forward to the table for click-to-select / scroll. In auto mode,
+    # clicking a row also loads its heatmap; in manual mode, the click
+    # only moves the selection (Enter is required to view).
     prev = m.table.selected
     handle_mouse!(m.table, evt)
-    if m.table.selected != prev
-        _load_heatmap!(m)
+    if !m.manual_mode && m.table.selected != prev
+        _load_heatmap!(m, m.table.selected)
     end
 end
 
@@ -211,6 +248,11 @@ function _render_view(m::HitViewerModel, f::Frame)
         set_string!(buf, header_area.x + length("$nhits hits"), header_area.y,
                     info, tstyle(:accent, bold=true))
     end
+    if m.manual_mode
+        tag = " MANUAL"
+        set_string!(buf, right(header_area) - length(tag) + 1, header_area.y,
+                    tag, tstyle(:warning, bold=true))
+    end
 
     # ── Body: left = table, right = heatmap + metadata ──
     # Vertical separator column eats 1 char.  Table gets 60%, right col fill.
@@ -220,12 +262,17 @@ function _render_view(m::HitViewerModel, f::Frame)
     sep_area   = body_cols[2]
     right_area = body_cols[3]
 
-    # Render the table
+    # Render the table. In manual mode, tint the currently-viewed row
+    # (the one shown in the heatmap/metadata) so it stands out from the
+    # selection cursor. When the viewed row is also the selected row the
+    # DataTable's selected_style wins, so there's no clash.
     m.table.block = Block(title="Signals",
                           border_style=tstyle(:border),
                           title_style=tstyle(:title))
     m.table.tick = m.tick
+    _apply_viewed_row_style!(m)
     render(m.table, table_area, buf)
+    _draw_viewed_marker!(m, buf)
 
     # Render the separator
     for ry in sep_area.y:bottom(sep_area)
@@ -256,6 +303,51 @@ function _render_view(m::HitViewerModel, f::Frame)
     _render_footer(m, footer_area, buf)
 end
 
+# ── Viewed-hit table highlight ────────────────────────────────────────
+#
+# In manual mode the hit shown in the heatmap/metadata panel (current_idx)
+# can differ from the table's selection cursor. We mark that row in two
+# ways so it's distinguishable from the selection highlight (accent ▸):
+#   1. row_styles tint — the row's text gets the theme's secondary color
+#      (handled inside DataTable::render, which ignores row_styles for
+#      the selected row, so no clash when viewed == selected).
+#   2. left-margin marker — VIEWED_MARKER (●) drawn in the secondary
+#      color at the row's left edge (only when viewed != selected; the
+#      selected row already draws its own ▸ there).
+
+"Ensure `m.table.row_styles` is the right length and tint the viewed row."
+function _apply_viewed_row_style!(m::HitViewerModel)
+    n = length(m.hits)
+    dt = m.table
+    if length(dt.row_styles) != n
+        resize!(dt.row_styles, n)
+    end
+    fill!(dt.row_styles, tstyle(:text))
+    v = m.current_idx
+    if m.manual_mode && v > 0 && v <= n
+        dt.row_styles[v] = tstyle(:secondary)
+    end
+end
+
+"Draw the viewed-hit marker in the table's left margin (manual mode only)."
+function _draw_viewed_marker!(m::HitViewerModel, buf::Buffer)
+    m.manual_mode || return
+    v = m.current_idx
+    (v == 0 || v > length(m.hits)) && return
+    dt = m.table
+    # Don't double-mark: the selected row already shows ▸.
+    dt.selected == v && return
+    # Find the viewed row's display position in the current sort order.
+    pos = findfirst(==(v), dt.sort_perm)
+    pos === nothing && return
+    vis_h = dt.last_content_area.height - 2  # header + separator
+    vi = pos - dt.offset
+    (vi < 1 || vi > vis_h) && return  # scrolled out of view
+    y = dt.last_content_area.y + 1 + vi
+    set_char!(buf, dt.last_content_area.x, y, VIEWED_MARKER,
+              tstyle(:secondary, bold=true))
+end
+
 function _render_heatmap(m::HitViewerModel, area::Rect, f::Frame)
     buf = f.buffer
 
@@ -264,11 +356,15 @@ function _render_heatmap(m::HitViewerModel, area::Rect, f::Frame)
     # cells with the background so no stale text leaks through.
     inner = area
 
-    # If no hit is selected, just clear interior with a hint
+    # If no hit is loaded, just clear interior with a hint.
     if m.heatmap === nothing
-        msg = m.current_idx == 0 && m.table.selected == 0 ?
-              "no hit selected" :
-              "select a hit to load its filterbank.data"
+        msg = if m.current_idx == 0 && m.table.selected == 0
+            "no hit selected"
+        elseif m.manual_mode
+            "press Enter to view the selected hit"
+        else
+            "select a hit to load its filterbank.data"
+        end
         mx = inner.x + max(0, (inner.width - length(msg)) ÷ 2)
         my = inner.y + max(0, inner.height ÷ 2)
         set_string!(buf, mx, my, msg, tstyle(:text_dim, dim=true))
@@ -281,12 +377,13 @@ end
 # ── Hit metadata panel ────────────────────────────────────────────────
 #
 # Renders a bordered Block below the heatmap showing key/value pairs for
-# the currently selected hit (signal + filterbank metadata). The Block
-# gives it a visual frame consistent with the table on the left side.
+# the currently viewed hit (the one in the heatmap; in auto mode this is
+# the selected hit, in manual mode it's the last hit loaded with Enter).
+# The Block gives it a visual frame consistent with the table on the left.
 
 function _render_metadata(m::HitViewerModel, area::Rect, buf::Buffer)
     (area.width < 2 || area.height < 2) && return
-    idx = m.table.selected
+    idx = m.current_idx
     title = (idx == 0 || idx > length(m.hits)) ? "Metadata" : "Hit $idx metadata"
     block = Block(title=title,
                   border_style=tstyle(:border),
@@ -374,7 +471,7 @@ function _draw_pixel_heatmap(m::HitViewerModel, data::Matrix{Float32}, area::Rec
     if sz != size(m.surf.data)
         # Cache miss: rebuild figure, surface, and pixel image.
         nch, nt = size(data)
-        hitidx = m.table.selected
+        hitidx = m.current_idx
         hit = (hitidx > 0 && hitidx ≤ length(m.hits)) ? m.hits[hitidx] : nothing
 
         # Title/subtitle with hit metadata (N3=frequency/time).
@@ -465,9 +562,11 @@ function _render_footer(m::HitViewerModel, area::Rect, buf::Buffer)
     if isempty(status)
         status = isempty(m.hits) ? "no hits loaded" : "ready"
     end
+    keys = m.manual_mode ?
+        "  [↑↓]navigate [Enter]view [m]auto [o]open [r]reload [q/Esc]quit " :
+        "  [↑↓]navigate [m]manual [o]open file [r]reload [q/Esc]quit "
     render(StatusBar(
-        left=[Span("  [↑↓]navigate [o]open file [r]reload [q/Esc]quit ",
-                    tstyle(:text_dim))],
+        left=[Span(keys, tstyle(:text_dim))],
         right=[Span(status, tstyle(:accent, bold=true))],
     ), area, buf)
 end
@@ -571,7 +670,9 @@ for the duration of the app, so it takes effect before Tachikoma's
 terminal probe runs.
 
 In view mode, press `o` to open the file picker and switch to another
-`.hits` file without restarting the app.
+`.hits` file without restarting the app. Press `m` to toggle manual mode,
+where the heatmap only loads when you press Enter on a selected hit
+(rather than auto-loading as you navigate).
 """
 function run_viewer(path::Union{Nothing,AbstractString}=nothing;
                     theme_name=nothing,

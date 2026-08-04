@@ -56,10 +56,18 @@ hitsviewer
 
 | Key                         | Action                                   |
 | --------------------------- | ---------------------------------------- |
-| `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` | navigate hits (heatmap auto-reloads) |
+| `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` | navigate hits (cursor moves; heatmap loads per mode) |
+| `Enter`                     | view selected hit (manual mode)          |
+| `m`                         | toggle manual / auto mode                |
 | `o`                         | open file picker (browse mode)           |
 | `r`                         | reload data for current hit              |
 | `q` / `Esc`                 | quit                                     |
+
+In **auto mode** (default), navigating the table automatically loads each
+hit's heatmap and metadata. In **manual mode**, navigation only moves the
+selection cursor; press `Enter` to load the selected hit. The viewed row
+is marked with `●` so it stays visible when the cursor has moved
+elsewhere. Toggling back to auto mode loads the currently selected hit.
 
 ### Keybindings (browse mode)
 

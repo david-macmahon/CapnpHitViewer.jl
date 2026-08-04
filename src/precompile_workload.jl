@@ -127,6 +127,17 @@ end
             _open_picker!(m; start_dir=dirname(tmp_hits))
             Base.invokelatest(view, m, f)
 
+            # Manual mode render path — exercises _apply_viewed_row_style!
+            # and _draw_viewed_marker! (which only run when manual_mode is
+            # set and the viewed row differs from the selection).
+            m.mode = :view
+            m.picker = nothing
+            m.manual_mode = true
+            m.table.selected = 2
+            Base.invokelatest(view, m, f)
+            m.manual_mode = false
+            m.table.selected = 1
+
             # ── Sixel/kitty graphics-protocol render paths ───────────
             # _draw_pixel_heatmap now ends with render(m.img, area, f; tick=),
             # which dispatches on GRAPHICS_PROTOCOL[]: gfx_none → braille,
@@ -270,6 +281,9 @@ end
         # Force these specializations into the precompile cache.
         precompile(CapnpHitViewer.view, (HitViewerModel, Tachikoma.Frame))
         precompile(CapnpHitViewer._render_view, (HitViewerModel, Tachikoma.Frame))
+        precompile(CapnpHitViewer._apply_viewed_row_style!, (HitViewerModel,))
+        precompile(CapnpHitViewer._draw_viewed_marker!,
+                   (HitViewerModel, Tachikoma.Buffer))
         precompile(CapnpHitViewer._render_heatmap,
                    (HitViewerModel, Tachikoma.Rect, Tachikoma.Frame))
         precompile(CapnpHitViewer._render_metadata,
