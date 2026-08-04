@@ -7,7 +7,8 @@
 #   │ hit table            │ heatmap (PixelImage)               │
 #   │ (DataTable)          │ filterbank.data reshaped to        │
 #   │                      │ numChannels × numTimesteps         │
-#   │                      │                                    │
+#   │                      ├────────────────────────────────────┤
+#   │                      │ hit metadata (Block)               │
 #   ├──────────────────────┴────────────────────────────────────┤
 #   │ status bar / keybindings                                   │
 #   └───────────────────────────────────────────────────────────┘
@@ -211,13 +212,13 @@ function _render_view(m::HitViewerModel, f::Frame)
                     info, tstyle(:accent, bold=true))
     end
 
-    # ── Body: left = table, right = heatmap ──
-    # Vertical separator column eats 1 char.  Table gets 60%, heatmap fill.
+    # ── Body: left = table, right = heatmap + metadata ──
+    # Vertical separator column eats 1 char.  Table gets 60%, right col fill.
     body_cols = split_layout(Layout(Horizontal, [Percent(60), Fixed(1), Fill()]), body_area)
     length(body_cols) < 3 && return
     table_area = body_cols[1]
     sep_area   = body_cols[2]
-    heat_area  = body_cols[3]
+    right_area = body_cols[3]
 
     # Render the table
     m.table.block = Block(title="Signals",
@@ -231,8 +232,25 @@ function _render_view(m::HitViewerModel, f::Frame)
         set_char!(buf, sep_area.x, ry, BOX_PLAIN.v, tstyle(:border, dim=true))
     end
 
+    # Split the right column into heatmap (fill) + metadata panel (fixed).
+    # The 1-cell gap lets the heatmap's Makie-rendered border and the
+    # metadata Block's border sit side by side without touching.
+    # Fixed(17) fits all 15 metadata rows + 2 border rows.
+    right_rows = split_layout(Layout(Vertical, [Fill(), Fixed(1), Fixed(17)]),
+                              right_area)
+    if length(right_rows) ≥ 3
+        heat_area = right_rows[1]
+        meta_area = right_rows[3]
+    else
+        heat_area = right_area
+        meta_area = Rect(0,0,0,0)
+    end
+
     # Render the heatmap
     _render_heatmap(m, heat_area, f)
+
+    # Render the metadata panel
+    _render_metadata(m, meta_area, buf)
 
     # ── Footer ──
     _render_footer(m, footer_area, buf)
@@ -258,6 +276,84 @@ function _render_heatmap(m::HitViewerModel, area::Rect, f::Frame)
     end
 
     _draw_pixel_heatmap(m, m.heatmap, inner, f)
+end
+
+# ── Hit metadata panel ────────────────────────────────────────────────
+#
+# Renders a bordered Block below the heatmap showing key/value pairs for
+# the currently selected hit (signal + filterbank metadata). The Block
+# gives it a visual frame consistent with the table on the left side.
+
+function _render_metadata(m::HitViewerModel, area::Rect, buf::Buffer)
+    (area.width < 2 || area.height < 2) && return
+    idx = m.table.selected
+    title = (idx == 0 || idx > length(m.hits)) ? "Metadata" : "Hit $idx metadata"
+    block = Block(title=title,
+                  border_style=tstyle(:border),
+                  title_style=tstyle(:title))
+    inner = render(block, area, buf)
+    (inner.width < 2 || inner.height < 1) && return
+
+    if idx == 0 || idx > length(m.hits)
+        msg = "no hit selected"
+        mx = inner.x + max(0, (inner.width - length(msg)) ÷ 2)
+        my = inner.y + max(0, inner.height ÷ 2)
+        set_string!(buf, mx, my, msg, tstyle(:text_dim, dim=true))
+        return
+    end
+
+    hit = m.hits[idx]
+    # Two-column key/value rows. Label style dim, value style normal/bold.
+    label_w = 16
+    rows = [
+        ("Source",        hit.sourceName),
+        ("Frequency",     string(round(hit.frequency; digits=6), " MHz")),
+        ("SNR",           string(round(Float64(hit.snr); digits=2))),
+        ("DriftRate",     string(round(hit.driftRate; digits=6), " Hz/s")),
+        ("DriftSteps",    string(Int(hit.driftSteps))),
+        ("Beam",          string(Int(hit.beam))),
+        ("CoarseChannel", string(Int(hit.coarseChannel))),
+        ("NumChannels",   string(Int(hit.numChannels))),
+        ("NumTimesteps",  string(Int(hit.numTimesteps))),
+        ("fch1",          string(round(hit.fch1; digits=6), " MHz")),
+        ("foff",          string(round(hit.foff * 1e6; digits=3), " Hz")),
+        ("tsamp",         string(round(hit.tsamp; digits=6), " s")),
+        ("tstart",        string(round(hit.tstart; digits=6))),
+        ("RA",            _ra_sexagesimal(hit.ra)),
+        ("Dec",           _dec_sexagesimal(hit.dec)),
+    ]
+
+    y = inner.y
+    for (k, v) in rows
+        y > bottom(inner) && break
+        set_string!(buf, inner.x, y, k, tstyle(:text_dim))
+        set_string!(buf, inner.x + label_w, y, v, tstyle(:text, bold=true);
+                    max_x=right(inner))
+        y += 1
+    end
+end
+
+# Format RA (in hours) as sexagesimal HHhMMmSS.SSSs, rounding fractional
+# seconds to 3 places.
+function _ra_sexagesimal(ra::Real)::String
+    r = mod(ra, 24.0)
+    h = floor(Int, r)
+    r = (r - h) * 60.0
+    m = floor(Int, r)
+    s = (r - m) * 60.0
+    @sprintf("%dh%02dm%06.3fs", h, m, s)
+end
+
+# Format Dec (in degrees) as sexagesimal ±DD°MMmSS.SSSs, rounding fractional
+# seconds to 3 places. The leading sign preserves the hemisphere.
+function _dec_sexagesimal(dec::Real)::String
+    sign = dec < 0 ? -1 : 1
+    d = abs(dec)
+    deg = floor(Int, d)
+    d = (d - deg) * 60.0
+    m = floor(Int, d)
+    s = (d - m) * 60.0
+    @sprintf("%s%d°%02dm%06.3fs", sign < 0 ? "-" : "+", deg, m, s)
 end
 
 # Render the heatmap via CairoMakie directly into a Matrix{RGB24}

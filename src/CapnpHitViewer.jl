@@ -6,6 +6,7 @@ using CairoMakie
 using CairoMakie.Cairo: CairoImageSurface, CairoSurfaceImage
 using CairoMakie.Colors: RGB24
 using PrecompileTools: @compile_workload
+using Printf: @sprintf
 # Tachikoma and Makie both export MouseEvent (and possibly other names).
 # Explicitly import the Tachikoma bindings we use unqualified so the
 # `using Tachikoma` above doesn't create ambiguities now that Makie is

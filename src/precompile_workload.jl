@@ -272,6 +272,8 @@ end
         precompile(CapnpHitViewer._render_view, (HitViewerModel, Tachikoma.Frame))
         precompile(CapnpHitViewer._render_heatmap,
                    (HitViewerModel, Tachikoma.Rect, Tachikoma.Frame))
+        precompile(CapnpHitViewer._render_metadata,
+                   (HitViewerModel, Tachikoma.Rect, Tachikoma.Buffer))
         precompile(CapnpHitViewer._render_footer,
                    (HitViewerModel, Tachikoma.Rect, Tachikoma.Buffer))
         precompile(CapnpHitViewer._draw_pixel_heatmap,
