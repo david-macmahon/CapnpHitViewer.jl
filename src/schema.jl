@@ -5,6 +5,7 @@
 # `__init__` into the `SETICORE_SCHEMA` Ref, which the rest of the
 # package reads via `SETICORE_SCHEMA[]`.
 
+"Embedded seticore Cap'n Proto schema text (parsed once in `__init__`)."
 const SETICORE_SCHEMA_TEXT = raw"""@0xb811e7262df2bb01;
 
 struct Signal {
