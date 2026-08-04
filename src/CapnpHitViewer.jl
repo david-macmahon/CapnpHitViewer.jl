@@ -67,4 +67,12 @@ include("filepicker.jl")
 include("app.jl")
 include("precompile_workload.jl")
 
+# Entry point for the `hitsviewer` Pkg.App (see [apps] in Project.toml).
+# Runs run_viewer with the first positional arg as the hits file path,
+# or with no path (browse mode) when no args are given.
+function (@main)(ARGS=[])
+    path = isempty(ARGS) ? nothing : ARGS[1]
+    run_viewer(path)
+end
+
 end # module
