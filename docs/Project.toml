@@ -1,5 +1,5 @@
 [deps]
-CapnpHitViewer = "6e6df8c0-dba9-49be-9fd3-d4a0ef72fecc"
+CapnpHitViewer = "0caff873-4fe7-4862-b037-9de8ddfd0939"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 
 [sources]
