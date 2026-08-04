@@ -1,4 +1,11 @@
-@0xb811e7262df2bb01;
+# ── Embedded seticore schema ──────────────────────────────────────────
+#
+# The schema text is embedded as a string constant so the package is
+# self-contained (no external file lookup at runtime). It is parsed in
+# `__init__` into the `SETICORE_SCHEMA` Ref, which the rest of the
+# package reads via `SETICORE_SCHEMA[]`.
+
+const SETICORE_SCHEMA_TEXT = raw"""@0xb811e7262df2bb01;
 
 struct Signal {
   frequency @0 :Float64;
@@ -61,3 +68,7 @@ struct Stamp {
   schan @18 :Int32;
   obsid @19 :Text;
 }
+"""
+
+"Parsed seticore schema, filled by `__init__`. Read via `SETICORE_SCHEMA[]`."
+const SETICORE_SCHEMA = Ref{SchemaFile}()
