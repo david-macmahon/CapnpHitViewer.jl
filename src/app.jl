@@ -82,8 +82,7 @@ function _build_table(hits::Vector{HitMetadata})::DataTable
 
     DataTable([
         DataColumn("#",         idx;     align=col_right),
-        DataColumn("Frequency", freq;    align=col_right,
-                   format=v -> string(v, " Hz")),
+        DataColumn("Frequency", freq;    align=col_right),
         DataColumn("SNR",       snr;     align=col_right),
         DataColumn("DriftRate", drift;   align=col_right),
         DataColumn("Steps",     steps;   align=col_right),
