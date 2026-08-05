@@ -1,6 +1,8 @@
 # CapnpHitViewer.jl
 
-A terminal UI for browsing seticore `.hits` files. Reads the
+A terminal UI for browsing `.hits` files created by
+[seticore](https://github.com/lacker/seticore.git) and
+[bliss](https://github.com/UCBerkeleySETI/bliss.git). Reads the
 [Cap'n Proto](https://capnproto.org)-encoded hit records, lists them in a
 table, renders the filterbank data as a heatmap, and shows per-hit
 metadata. Built with [Tachikoma](https://github.com/JuliaTachikoma/Tachikoma.jl)
@@ -23,6 +25,8 @@ and [CairoMakie](https://github.com/MakieOrg/Makie.jl).
 ```
 
 ## Install
+
+Requires Julia v1.11 or higher.
 
 > **Note:** A Sixel- or Kitty-graphics-enabled terminal is strongly
 > recommended. The heatmap is rendered as an in-band image; without
