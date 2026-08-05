@@ -1,8 +1,8 @@
 name = "CapnpHitViewer"
 uuid = "0caff873-4fe7-4862-b037-9de8ddfd0939"
+license = "BSD-2-Clause"
 version = "0.1.0"
 authors = ["David MacMahon <davidm@astro.berkeley.edu>"]
-license = "BSD-2-Clause"
 
 [deps]
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
@@ -12,7 +12,7 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Tachikoma = "468859d6-42d8-48b7-8ad9-1d312e0e3b0a"
 
 [sources]
-CapnProto = {url = "https://github.com/david-macmahon/CapnProto.jl.git"}
+CapnProto = {rev = "main", url = "https://github.com/david-macmahon/CapnProto.jl.git"}
 
 [compat]
 CairoMakie = "0.15.13"
