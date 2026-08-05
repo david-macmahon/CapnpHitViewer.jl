@@ -1,5 +1,8 @@
 # CapnpHitViewer.jl
 
+[![](https://img.shields.io/badge/docs-stable-blue.svg)](https://david-macmahon.github.io/CapnpHitViewer.jl/stable)
+[![](https://img.shields.io/badge/docs-dev-blue.svg)](https://david-macmahon.github.io/CapnpHitViewer.jl/dev)
+
 A terminal UI for browsing `.hits` files created by
 [seticore](https://github.com/lacker/seticore.git) and
 [bliss](https://github.com/UCBerkeleySETI/bliss.git). Reads the
