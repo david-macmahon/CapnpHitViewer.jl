@@ -234,6 +234,30 @@ end
             end
         end
 
+        # ── File-load and picker-callback paths ──────────────────────
+        # The workload above builds the model directly, bypassing
+        # _load_file! (the wrapper called on startup and every picker
+        # selection). Exercise it now so the try/catch, abspath, field
+        # resets, and the _on_picker_select!/_close_picker! callbacks
+        # are compiled.
+        m2 = HitViewerModel()
+        _load_file!(m2, tmp_hits)
+        # Picker select callback → _load_file! success path
+        _on_picker_select!(m2, tmp_hits)
+        # Picker cancel → _close_picker! (with a file loaded: stays in :view)
+        _on_picker_cancel!(m2)
+        # Picker cancel on a fresh model (no file loaded: would quit)
+        m3 = HitViewerModel()
+        _on_picker_cancel!(m3)
+
+        # ── run_viewer setup path (up to the TUI loop) ───────────────
+        # run_viewer calls _normalize_gfx on every invocation; exercise
+        # all three branches (nothing, Symbol, String) so their
+        # specializations are compiled.
+        _normalize_gfx(nothing)
+        _normalize_gfx(:kitty)
+        _normalize_gfx("sixel")
+
         # ── Explicit precompile() for invokelatest-defeated specializations ──
         # Tachikoma's app loop dispatches events via
         # `Base.invokelatest(dispatch_event!, ..., model::Model, evt::Event)`
@@ -266,6 +290,21 @@ end
                    (FilePicker, Tachikoma.MouseEvent))
         precompile(CapnpHitViewer._update_view!,
                    (HitViewerModel, Tachikoma.KeyEvent))
+
+        # ── File-load and picker-callback specializations ───────────
+        # _load_file! is the wrapper called on startup and every picker
+        # selection; _on_picker_select!/_on_picker_cancel!/_close_picker!
+        # are the picker callbacks. _normalize_gfx runs on every
+        # run_viewer call (nothing/Symbol/String branches).
+        precompile(CapnpHitViewer._load_file!,
+                   (HitViewerModel, AbstractString))
+        precompile(CapnpHitViewer._on_picker_select!,
+                   (HitViewerModel, AbstractString))
+        precompile(CapnpHitViewer._on_picker_cancel!, (HitViewerModel,))
+        precompile(CapnpHitViewer._close_picker!, (HitViewerModel,))
+        precompile(CapnpHitViewer._normalize_gfx, (Nothing,))
+        precompile(CapnpHitViewer._normalize_gfx, (Symbol,))
+        precompile(CapnpHitViewer._normalize_gfx, (AbstractString,))
 
         # ── Render path specializations (same invokelatest barrier) ──
         # Tachikoma's app loop calls `view(model, f)` via
