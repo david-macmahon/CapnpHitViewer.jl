@@ -36,6 +36,13 @@ Run without arguments to start in browse mode (file picker):
 hitsviewer
 ```
 
+A small sample file (`test/sample.hits`) is included in the repository for
+trying things out:
+
+```
+hitsviewer test/sample.hits
+```
+
 ### Keybindings (view mode)
 
 | Key                         | Action                                   |
