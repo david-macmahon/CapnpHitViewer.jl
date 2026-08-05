@@ -17,5 +17,5 @@ makedocs(
 
 deploydocs(
     repo = "github.com/david-macmahon/CapnpHitViewer.jl.git",
-    devbranch = "master",
+    devbranch = "main",
 )
