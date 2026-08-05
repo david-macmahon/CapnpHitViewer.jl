@@ -1,10 +1,10 @@
 # CapnpHitViewer.jl
 
-A terminal UI for browsing seticore `.hits` files. Reads the capnp-encoded
-hit records, lists them in a table, renders the filterbank data as a
-heatmap, and shows per-hit metadata. Built with
-[Tachikoma](https://github.com/JuliaTachikoma/Tachikoma.jl) and
-[CairoMakie](https://github.com/MakieOrg/Makie.jl).
+A terminal UI for browsing seticore `.hits` files. Reads the
+[Cap'n Proto](https://capnproto.org)-encoded hit records, lists them in a
+table, renders the filterbank data as a heatmap, and shows per-hit
+metadata. Built with [Tachikoma](https://github.com/JuliaTachikoma/Tachikoma.jl)
+and [CairoMakie](https://github.com/MakieOrg/Makie.jl).
 
 ## Install
 
